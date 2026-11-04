@@ -1,10 +1,27 @@
 name: CI
 
+# Prüft jeden Pull Request und jeden Push auf main. Auf main danach: Image für den Cluster dockly-k8s bauen
+# und ausrollen (Jobs image und rollout). API und arq-Worker laufen aus demselben Image.
+#
+# Ausrollen: Nach dem Push schreibt der Job rollout Tag und Digest ins GitOps-Repo Hylab-Media/k8s-platform
+# (apps/dockly-portal/docklyocr/values.yaml), Argo CD rollt aus. Ein manueller Start auf main rollt den Stand
+# erneut aus. Ersetzt den Deploy per SSH auf die Instanz DocklyOCR-API (/opt/dockly-ocr, docker compose).
+#
+# Secrets (k8s-platform/scripts/github-deploy-zugang.sh):
+#   SCW_SECRET_KEY            IAM-Schlüssel, nur Schreibrecht auf die Registry
+#   K8S_PLATFORM_DEPLOY_KEY   Deploy-Key mit Schreibrecht auf Hylab-Media/k8s-platform
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
   pull_request:
     branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -34,3 +51,129 @@ jobs:
 
       - name: Pytest
         run: .venv/bin/pytest tests/ -v
+
+  image:
+    name: image
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    services:
+      redis:
+        image: redis:7.4-alpine
+        ports: ["6379:6379"]
+    env:
+      IMAGE: rg.fr-par.scw.cloud/docklyocr/docklyocr
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Registry-Login
+        env:
+          SCW_SECRET_KEY: ${{ secrets.SCW_SECRET_KEY }}
+        run: |
+          [ -n "${SCW_SECRET_KEY}" ] || { echo "::error::Secret SCW_SECRET_KEY fehlt."; exit 1; }
+          printf '%s' "${SCW_SECRET_KEY}" | docker login rg.fr-par.scw.cloud -u nologin --password-stdin
+
+      - name: Buildx-Builder (docker-container, für den Registry-Cache)
+        run: docker buildx create --name docklyocr --driver docker-container --use --bootstrap
+
+      - name: Image bauen
+        run: |
+          docker buildx build --pull \
+            --cache-from "type=registry,ref=${IMAGE}:buildcache" \
+            --cache-to "type=registry,ref=${IMAGE}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true" \
+            --load --tag docklyocr:kandidat .
+
+      # Wie im Cluster: Nutzer 10001, schreibgeschütztes Dateisystem, /data und /tmp beschreibbar. Die API legt
+      # beim Start die SQLite-Tabellen an und muss /health liefern; der arq-Worker muss sich an Redis anmelden.
+      - name: Probe des Images
+        run: |
+          set -euo pipefail
+          docker network create probe > /dev/null
+          gw=$(docker network inspect probe -f '{{(index .IPAM.Config 0).Gateway}}')
+          sicher=(--network probe -u 10001:10001 --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true
+                  -e HOME=/tmp -e DATABASE_URL=sqlite:////data/ocr.db -e STORAGE_DIR=/data/storage -e REDIS_URL=redis://${gw}:6379/0
+                  -e SESSION_SECRET=$(openssl rand -hex 32) -v probe-daten:/data)
+          docker run --rm -u 0 -v probe-daten:/data --entrypoint chown docklyocr:kandidat 10001:10001 /data
+          docker run -d --name api "${sicher[@]}" -p 127.0.0.1:8000:8000 docklyocr:kandidat > /dev/null
+          docker run -d --name worker "${sicher[@]}" docklyocr:kandidat arq app.workers.ocr_worker.WorkerSettings > /dev/null
+          ende() { for c in api worker; do echo "── Log ${c}"; docker logs "$c" 2>&1 | tail -n 30; done; exit 1; }
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8000/health -o /dev/null 2>/dev/null && break
+            [ "$i" = 30 ] && { echo "API antwortet nicht"; ende; }
+            sleep 2
+          done
+          docker run --rm -u 10001:10001 -v probe-daten:/data --entrypoint ls docklyocr:kandidat /data/ocr.db > /dev/null || { echo "ocr.db fehlt"; ende; }
+          for i in $(seq 1 20); do
+            docker logs worker 2>&1 | grep -q 'Starting worker' && break
+            [ "$i" = 20 ] && { echo "Worker meldet keinen Start"; ende; }
+            sleep 2
+          done
+          echo "API liefert /health mit angelegter Datenbank, Worker läuft."
+
+      - name: Image pushen
+        id: push
+        run: |
+          set -euo pipefail
+          docker tag docklyocr:kandidat "${IMAGE}:${GITHUB_SHA}"
+          docker push --quiet "${IMAGE}:${GITHUB_SHA}"
+          echo "digest=$(docker inspect --format '{{index .RepoDigests 0}}' "${IMAGE}:${GITHUB_SHA}" | sed 's/.*@//')" >> "$GITHUB_OUTPUT"
+
+      - name: Registry-Logout
+        if: always()
+        run: docker logout rg.fr-par.scw.cloud || true
+
+  # Eigener Job ohne Code aus diesem Repo: Nur er sieht den Schreibschlüssel für das GitOps-Repo.
+  rollout:
+    name: rollout
+    needs: image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment:
+      name: production
+      url: https://ocr.dockly.de
+    concurrency:
+      group: rollout-production
+      cancel-in-progress: false
+    env:
+      SHA: ${{ github.sha }}
+      DIGEST: ${{ needs.image.outputs.digest }}
+    steps:
+      - name: Checkout GitOps-Repo
+        uses: actions/checkout@v5
+        with:
+          repository: Hylab-Media/k8s-platform
+          ssh-key: ${{ secrets.K8S_PLATFORM_DEPLOY_KEY }}
+          path: k8s-platform
+
+      # Tag plus Digest: Der Tag zeigt, welcher Commit läuft; der Digest legt das Image fest.
+      - name: Image im GitOps-Repo setzen
+        working-directory: k8s-platform
+        run: |
+          set -euo pipefail
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "Unerwarteter Commit-Wert: ${SHA}"; exit 1; }
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "Unerwarteter Digest: ${DIGEST}"; exit 1; }
+          werte=apps/dockly-portal/docklyocr/values.yaml
+          sed -i -E "s|^  tag: .*$|  tag: ${SHA}@${DIGEST}|" "$werte"
+          grep -qxF "  tag: ${SHA}@${DIGEST}" "$werte" || { echo "Tag nicht gesetzt"; exit 1; }
+          if git diff --quiet; then echo "Image steht bereits auf ${SHA}"; exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -qam "DocklyOCR: Image ${SHA}"
+          for versuch in 1 2 3; do
+            git push -q && exit 0
+            echo "Push abgelehnt, hole den neuesten Stand (${versuch}/3)"; git pull -q --rebase
+          done
+          echo "Tag konnte nicht ins GitOps-Repo geschrieben werden"; exit 1
+
+      # Bis zum Umschalten des DNS fragt dieser Test noch die Instanz.
+      - name: Smoke-Test nach dem Ausrollen
+        run: |
+          set -euo pipefail
+          sleep 180
+          curl -fsS --retry 6 --retry-delay 10 --retry-all-errors https://ocr.dockly.de/health -o /dev/null
+          echo "https://ocr.dockly.de/health antwortet."
